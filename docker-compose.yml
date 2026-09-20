@@ -1,0 +1,11 @@
+services:
+  desensitize-api:
+    build: .
+    image: text-desensitize-api:latest
+    container_name: text-desensitize-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      MAX_TEXT_LENGTH: ${MAX_TEXT_LENGTH:-1000000}
+      MAX_RULES: ${MAX_RULES:-500}
+    restart: unless-stopped

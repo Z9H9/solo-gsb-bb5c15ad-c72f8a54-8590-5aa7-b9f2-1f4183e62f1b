@@ -7,5 +7,7 @@ import os
 MAX_TEXT_LENGTH: int = int(os.environ.get("MAX_TEXT_LENGTH", "1000000"))
 #: 单次请求最大规则数，超出返回 422
 MAX_RULES: int = int(os.environ.get("MAX_RULES", "500"))
+#: 流水线请求最大阶段数，超出返回 422
+MAX_STAGES: int = int(os.environ.get("MAX_STAGES", "20"))
 #: 容器内监听端口（compose 默认映射到宿主机 8000）
 PORT: int = int(os.environ.get("PORT", "8000"))

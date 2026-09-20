@@ -3,7 +3,8 @@
 基于 FastAPI 的文本脱敏服务：客户端提交原文与多条正则脱敏规则（含优先级、替换模板），
 服务找出全部命中，按 **优先级 → 起始位置 → 规则顺序** 确定性消解重叠，仅替换胜出区间，
 返回脱敏文本、每个命中的处理状态及原文/结果区间映射。非法正则逐条报错，不影响其他规则。
-纯内存处理，无数据库。
+另提供 **多阶段流水线** 接口：按顺序执行多组规则，后续阶段可命中前序替换生成的内容，
+每个命中同时给出阶段输入区间与映射回初始原文的区间。纯内存处理，无数据库。
 
 ## 快速开始（单条命令）
 
@@ -15,7 +16,8 @@ docker compose up --build
 
 | 地址 | 说明 |
 | --- | --- |
-| http://localhost:8000/api/v1/desensitize | 脱敏接口（POST） |
+| http://localhost:8000/api/v1/desensitize | 脱敏接口（POST，单阶段） |
+| http://localhost:8000/api/v1/desensitize/pipeline | 多阶段流水线脱敏接口（POST） |
 | http://localhost:8000/health | 健康检查（GET） |
 | http://localhost:8000/docs | Swagger 交互文档 |
 | http://localhost:8000/ | 服务信息 |
@@ -35,7 +37,8 @@ docker run -d -p 8000:8000 text-desensitize-api
 | --- | --- | --- |
 | `API_PORT` | `8000` | 宿主机映射端口（仅 Compose 使用） |
 | `MAX_TEXT_LENGTH` | `1000000` | 原文最大字符数，超出返回 422 |
-| `MAX_RULES` | `500` | 单次请求最大规则数，超出返回 422 |
+| `MAX_RULES` | `500` | 单阶段最大规则数（两个接口均适用），超出返回 422 |
+| `MAX_STAGES` | `20` | 流水线最大阶段数，超出返回 422 |
 
 示例：`docker run -e MAX_TEXT_LENGTH=500000 -p 8000:8000 text-desensitize-api`
 
@@ -103,6 +106,93 @@ curl -s -X POST http://localhost:8000/api/v1/desensitize \
 - `rule_errors`：非法规则逐条报错（`stage` 区分正则编译失败 `compile` 与替换模板非法
   `replacement`），不影响其他规则执行。
 
+### POST /api/v1/desensitize/pipeline（多阶段流水线）
+
+按顺序执行多个 stage：首阶段处理初始原文，其后每个阶段处理**上一阶段的输出文本**。
+每个 stage 复用与单阶段完全相同的规则格式与重叠消解规则；后续阶段可以命中前序替换
+生成的内容。响应同时返回最终文本（`masked_text`）与逐阶段结果（`stages`）。
+
+请求体：
+
+```json
+{
+  "text": "张三 13800001111",
+  "stages": [
+    {"rules": [{"id": "phone", "pattern": "1\\d{10}", "priority": 10,
+                "replacement": "[PHONE]"}]},
+    {"rules": [{"id": "tag",   "pattern": "PHONE", "replacement": "***"}]}
+  ]
+}
+```
+
+最终文本为 `"张三 [***]"`。第二阶段命中的 `PHONE` 完全由第一阶段替换新生，初始原文中
+并不存在对应内容，因此该命中的 `source_span` 为 `null`，并标记 `"generated": true`：
+
+```json
+{
+  "masked_text": "张三 [***]",
+  "stages": [
+    {
+      "stage_index": 0,
+      "masked_text": "张三 [PHONE]",
+      "matches": [
+        {"stage_index": 0, "rule_index": 0, "rule_id": "phone", "status": "applied",
+         "input_span":  {"start": 3, "end": 14},
+         "result_span": {"start": 3, "end": 10},
+         "source_span": {"start": 3, "end": 14},
+         "generated": false, "matched_text": "13800001111",
+         "replacement": "[PHONE]", "reason": null, "overlapped_by": null}
+      ],
+      "rule_errors": [],
+      "stats": {"text_length": 14, "masked_length": 10, "rules_total": 1,
+                "rules_invalid": 0, "matches_found": 1,
+                "matches_applied": 1, "matches_rejected": 0}
+    },
+    {
+      "stage_index": 1,
+      "masked_text": "张三 [***]",
+      "matches": [
+        {"stage_index": 1, "rule_index": 0, "rule_id": "tag", "status": "applied",
+         "input_span":  {"start": 4, "end": 9},
+         "result_span": {"start": 4, "end": 7},
+         "source_span": null,
+         "generated": true, "matched_text": "PHONE",
+         "replacement": "***", "reason": null, "overlapped_by": null}
+      ],
+      "rule_errors": [],
+      "stats": {"text_length": 10, "masked_length": 8, "rules_total": 1,
+                "rules_invalid": 0, "matches_found": 1,
+                "matches_applied": 1, "matches_rejected": 0}
+    }
+  ],
+  "stats": {"text_length": 14, "masked_length": 8, "stages_total": 2,
+            "rules_total": 2, "rules_invalid": 0, "matches_found": 2,
+            "matches_applied": 2, "matches_rejected": 0}
+}
+```
+
+每个命中同时给出两套区间：
+
+- `input_span` / `result_span`：命中在**本阶段输入**（即上一阶段输出）与本阶段输出中
+  的区间，语义与单阶段接口一致（被否决命中映射到其存活片段，完全被覆盖时为空区间）；
+- `source_span`：命中内容**映射回初始原文**的区间，取其覆盖字符溯源偏移的最小外包区间。
+  - 替换模板中的分组引用（如 `\1`、`\g<name>`、`\g<0>`）展开的是命中片段，这些字符
+    继承命中位置的溯源；模板字面量与转义字符（`[`、`]`、`\n` 等）属于替换新生。
+  - 当变长替换、删除、重叠否决共同出现时，溯源链逐阶段组合，`source_span` 依然成立；
+    若中间发生过删除，外包区间可能宽于实际逐字覆盖（包含已删除字符）。
+  - 若整段完全由替换新生、无法对应初始原文，`source_span` 为 `null` 且
+    `"generated": true`。
+
+其他约定：
+
+- 非法规则（正则编译失败 / 替换模板非法）**只在所属阶段的 `rule_errors` 中报错**，
+  不影响同阶段其他规则，也不影响后续阶段；模板非法仍延迟到该规则首次命中时判定，
+  与单阶段接口行为一致。
+- `stages` 至少 1 个，为空返回 422；阶段数超 `MAX_STAGES`、单阶段规则数超
+  `MAX_RULES`、初始原文超长均返回 422。
+- 阶段内规则只对进入该阶段时的文本做一次扫描，同一阶段内不会连锁触发后续替换
+  （与单阶段语义一致；需要连锁时拆成多个 stage）。
+
 ### 重叠消解规则（确定性）
 
 1. `priority` 数值大者优先；
@@ -125,15 +215,16 @@ uvicorn app.main:app --reload --port 8000   # 启动服务
 pytest                                      # 运行测试（核心逻辑 + API 端到端）
 ```
 
-核心脱敏逻辑在 `app/masking.py`，不依赖第三方包，可单独测试：
-`python3 -m unittest discover -s tests -p "test_masking.py"`。
+核心脱敏逻辑在 `app/masking.py` 与 `app/pipeline.py`，不依赖第三方包，可单独测试：
+`python3 -m unittest discover -s tests -p "test_*.py"`（`test_api.py` 会自动跳过缺失的 fastapi）。
 
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 入口：/health、/api/v1/desensitize
-  masking.py    # 核心逻辑：命中收集、重叠消解、区间映射（纯标准库）
+  main.py       # FastAPI 入口：/health、单阶段与流水线两个脱敏接口
+  masking.py    # 核心逻辑：命中收集、重叠消解、区间映射、替换模板溯源（纯标准库）
+  pipeline.py   # 多阶段流水线：逐阶段执行 + 映射回初始原文
   models.py     # 请求/响应模型（Pydantic）
   config.py     # 环境变量配置
 tests/          # 核心逻辑与 API 测试

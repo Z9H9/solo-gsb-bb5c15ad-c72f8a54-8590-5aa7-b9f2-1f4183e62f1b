@@ -26,6 +26,20 @@ class DesensitizeRequest(BaseModel):
     rules: list[Rule] = Field(default_factory=list, description="脱敏规则列表")
 
 
+class PipelineStage(BaseModel):
+    """流水线中的一个阶段：复用单阶段规则格式，处理上一阶段输出文本。"""
+
+    rules: list[Rule] = Field(default_factory=list, description="本阶段脱敏规则列表")
+
+
+class PipelineRequest(BaseModel):
+    text: str = Field(description="待脱敏初始原文")
+    stages: list[PipelineStage] = Field(
+        min_length=1,
+        description="按顺序执行的脱敏阶段（至少 1 个）；首阶段处理初始原文，后续阶段处理上一阶段输出",
+    )
+
+
 class Span(BaseModel):
     start: int = Field(description="区间起始偏移（含），按字符计")
     end: int = Field(description="区间结束偏移（不含），按字符计")
@@ -84,6 +98,66 @@ class DesensitizeResponse(BaseModel):
         description="非法规则逐条报错，不影响其他规则"
     )
     stats: Stats
+
+
+class PipelineMatchResult(BaseModel):
+    """流水线某阶段中的一个命中。"""
+
+    stage_index: int = Field(description="所属阶段下标（0 起）")
+    rule_index: int = Field(description="规则在所属阶段 rules 中的下标")
+    rule_id: Optional[str]
+    status: Literal["applied", "rejected_overlap"]
+    input_span: Span = Field(
+        description="命中区间（阶段输入文本中，即上一阶段输出）"
+    )
+    result_span: Span = Field(
+        description="命中对应内容在本阶段输出文本中的区间"
+    )
+    source_span: Optional[Span] = Field(
+        description=(
+            "命中内容映射回初始原文的区间（取覆盖字符溯源偏移的最小外包区间，"
+            "可能因删除/重排而宽于实际逐字覆盖）；"
+            "若整段完全由替换新生、无法对应初始原文则为 null"
+        )
+    )
+    generated: bool = Field(
+        description="true=整段完全由前序替换新生，初始原文中无对应区间"
+    )
+    matched_text: str = Field(description="命中的阶段输入片段")
+    replacement: Optional[str] = Field(
+        description="实际写入本阶段输出的替换内容（模板展开后）；被否决时为 null"
+    )
+    reason: Optional[str]
+    overlapped_by: Optional[OverlappedBy]
+
+
+class StageResult(BaseModel):
+    stage_index: int
+    masked_text: str = Field(description="本阶段输出文本（即下一阶段输入）")
+    matches: list[PipelineMatchResult] = Field(
+        description="本阶段全部命中（按阶段输入区间排序）"
+    )
+    rule_errors: list[RuleError] = Field(
+        description="本阶段非法规则逐条报错；非法规则仅在所属阶段报错，不影响后续阶段"
+    )
+    stats: Stats
+
+
+class PipelineStats(BaseModel):
+    text_length: int
+    masked_length: int
+    stages_total: int
+    rules_total: int = Field(description="各阶段规则数之和")
+    rules_invalid: int = Field(description="各阶段非法规则数之和")
+    matches_found: int = Field(description="各阶段命中数之和（含被否决）")
+    matches_applied: int = Field(description="各阶段已替换命中数之和")
+    matches_rejected: int = Field(description="各阶段被否决命中数之和")
+
+
+class PipelineResponse(BaseModel):
+    masked_text: str = Field(description="最终文本（最后一个阶段的输出）")
+    stages: list[StageResult] = Field(description="逐阶段结果，按请求顺序")
+    stats: PipelineStats
 
 
 class HealthResponse(BaseModel):

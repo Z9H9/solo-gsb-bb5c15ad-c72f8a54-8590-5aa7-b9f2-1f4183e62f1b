@@ -183,6 +183,44 @@ class TestSpanMapping(unittest.TestCase):
         self.assertEqual((rejected.result_start, rejected.result_end), (0, 7))
         self.assertEqual(r.masked_text[0:7], "0156789")
 
+    def test_rejected_start_inside_winner_maps_surviving_tail(self):
+        # 被否决区间起点落在胜出区间内部，结果区间仅映射尾部存活片段
+        text = "x[NN]y"
+        rules = [
+            rule(0, r"\[NN\]", priority=0, replacement="Z"),  # [1,5) 被否决
+            rule(1, r"x\[N", priority=5, replacement="W"),   # [0,3) 胜出
+        ]
+        r = mask_text(text, rules)
+        self.assertEqual(r.masked_text, "WN]y")
+        rejected = {m.rule_index: m for m in r.matches}[0]
+        self.assertEqual((rejected.result_start, rejected.result_end), (1, 3))
+        self.assertEqual(r.masked_text[1:3], "N]")
+
+    def test_rejected_fully_covered_anchors_after_first_winner(self):
+        # 被多个胜出区间完全覆盖：空区间吸附到首个覆盖区间的替换落点
+        text = "a1b2c3d4e5"
+        rules = [
+            rule(0, r"[a-z]\d", priority=5, replacement="X"),
+            rule(1, r".+", priority=0, replacement="Y"),
+        ]
+        r = mask_text(text, rules)
+        self.assertEqual(r.masked_text, "XXXXX")
+        rejected = {m.rule_index: m for m in r.matches}[1]
+        self.assertEqual((rejected.result_start, rejected.result_end), (1, 1))
+
+    def test_track_segments_describe_replacement_provenance(self):
+        text = "邮箱 alice@example.com"
+        r = mask_text(
+            text, [rule(0, r"(\w+)@(\w+\.\w+)", replacement=r"[\1]")],
+            track_segments=True,
+        )
+        applied = [m for m in r.matches if m.applied][0]
+        # 字面量 "[" / "]" 与组片段（相对命中偏移）交替
+        self.assertEqual(
+            applied.repl_segments,
+            [("lit", "["), ("grp", (0, 5)), ("lit", "]")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
